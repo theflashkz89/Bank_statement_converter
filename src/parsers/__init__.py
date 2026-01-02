@@ -3,6 +3,7 @@
 """
 from .base_parser import BaseParser
 from .airwallex_parser import AirwallexParser
+from .hsbc_parser import HSBCParser
 
-__all__ = ['BaseParser', 'AirwallexParser']
+__all__ = ['BaseParser', 'AirwallexParser', 'HSBCParser']
 
