@@ -80,7 +80,9 @@ class HSBCParser(BaseParser):
         """提取交易记录"""
         transactions = []
         # 状态机：记录当前处理的币种，默认为 Unknown
-        current_currency = "Unknown" 
+        current_currency = "Unknown"
+        # 运行余额：用于计算每笔交易的Balance
+        running_balance = {}  # {currency: balance}
         
         with pdfplumber.open(pdf_path) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
@@ -95,18 +97,18 @@ class HSBCParser(BaseParser):
                     if currency_match:
                         current_currency = currency_match.group(1).upper()
                     
-                    self._parse_tables(tables, current_currency, statement_date, transactions)
+                    self._parse_tables(tables, current_currency, statement_date, transactions, running_balance)
                 
                 else:
                     # 策略 2: 文本流解析 (HSBC 主力解析模式)
                     # 重点：传入当前的 transactions 列表和 current_currency，并允许函数返回更新后的币种
                     current_currency = self._extract_transactions_from_text(
-                        page_text, current_currency, statement_date, transactions
+                        page_text, current_currency, statement_date, transactions, running_balance
                     )
         
         return transactions
 
-    def _parse_tables(self, tables, currency, statement_date, transactions):
+    def _parse_tables(self, tables, currency, statement_date, transactions, running_balance: Dict[str, float]):
         """表格模式解析辅助函数"""
         for table in tables:
             if not table or len(table) < 2: continue
@@ -143,14 +145,33 @@ class HSBCParser(BaseParser):
                 date = parse_date_hsbc(date_str, statement_date.year, statement_date.month)
                 if not date: continue
 
+                # 提取金额
+                debit = parse_amount(col_withdrawal) if col_withdrawal else ''
+                credit = parse_amount(col_deposit) if col_deposit else ''
+                
+                # 计算Balance
+                if col_balance:
+                    # 如果表格中有Balance，使用表格中的
+                    final_balance = parse_amount(col_balance)
+                else:
+                    # 基于运行余额计算
+                    if currency not in running_balance:
+                        running_balance[currency] = 0.0
+                    credit_val = credit if credit else 0.0
+                    debit_val = debit if debit else 0.0
+                    final_balance = running_balance[currency] + credit_val - debit_val
+                
+                # 更新运行余额
+                running_balance[currency] = final_balance
+
                 tx = {
                     'Date': date,
                     'Account Currency': currency,
                     'Payer': 'Unknown',
                     'Payee': self._parse_transaction_details(details_str)['payee'],
-                    'Debit': parse_amount(col_withdrawal) if col_withdrawal else '',
-                    'Credit': parse_amount(col_deposit) if col_deposit else '',
-                    'Balance': parse_amount(col_balance) if col_balance else '',
+                    'Debit': debit,
+                    'Credit': credit,
+                    'Balance': final_balance,
                     'Reference': '',
                     'Description': details_str
                 }
@@ -158,10 +179,13 @@ class HSBCParser(BaseParser):
 
     def _extract_transactions_from_text(self, text: str, current_currency: str, 
                                        statement_date: datetime, 
-                                       transactions: List[Dict[str, Any]]) -> str:
+                                       transactions: List[Dict[str, Any]],
+                                       running_balance: Dict[str, float]) -> str:
         """
         从文本解析交易，支持行级币种切换
         返回: 更新后的 current_currency
+        
+        关键修复：同一天可能有多个交易，每个交易以POS MDC、CR TO等标识开始
         """
         lines = text.split('\n')
         
@@ -169,6 +193,24 @@ class HSBCParser(BaseParser):
         curr_date_str = None
         curr_details = []
         curr_balance = None
+        
+        # 交易类型标识模式（用于识别新交易）
+        transaction_patterns = [
+            r'^POS\s+MDC\s*\(',  # POS MDC (日期)
+            r'^CR\s+TO\s+',       # CR TO
+            r'^CASH\s+REBATE',   # CASH REBATE
+            r'^B/F\s+BALANCE',   # B/F BALANCE
+            r'^CREDIT\s+INTEREST',  # CREDIT INTEREST
+            r'^PAID\s+BY',        # PAID BY
+        ]
+        
+        # 识别包含Deposit和Balance的行（通常是新交易）
+        # 格式：N10906097777(09JAN24) 2,000.00 220,760.08
+        def is_deposit_with_balance(line: str) -> bool:
+            """检查是否是包含Deposit金额和Balance的行"""
+            # 匹配：字母数字(日期) 金额 余额
+            pattern = r'[A-Z0-9]+\(\d{2}[A-Z]{3}\d{2}\)\s+[\d,]+\.[\d]{2}\s+[\d,]+\.[\d]{2}'
+            return bool(re.search(pattern, line))
         
         for line in lines:
             line = line.strip()
@@ -184,14 +226,15 @@ class HSBCParser(BaseParser):
             # 跳过无用页眉
             if "Page" in line and "of" in line: continue
             if "Balance Brought Forward" in line: continue
+            if "Date TransactionDetails" in line: continue  # 表头行
 
             # [Fix] 匹配日期行 (交易开始)
             date_match = re.match(r'^(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)', line, re.IGNORECASE)
             
             if date_match:
                 # 遇到新日期，先保存上一条交易（如果存在）
-                if curr_date_str:
-                    self._save_text_transaction(curr_date_str, curr_details, curr_balance, current_currency, statement_date, transactions)
+                if curr_date_str and curr_details:
+                    self._save_text_transaction(curr_date_str, curr_details, curr_balance, current_currency, statement_date, transactions, running_balance)
                 
                 # 初始化新交易
                 curr_date_str = date_match.group(1)
@@ -213,48 +256,141 @@ class HSBCParser(BaseParser):
                 curr_details = [rest] if rest else []
                 
             else:
-                # 不是日期行，属于上一条交易的 Details
+                # 不是日期行，检查是否是新的交易标识（同一天内的第二个交易）
+                if curr_date_str and curr_details:
+                    # 检查这一行是否是新的交易类型标识
+                    is_new_transaction = False
+                    for pattern in transaction_patterns:
+                        if re.match(pattern, line, re.IGNORECASE):
+                            is_new_transaction = True
+                            break
+                    
+                    # 检查是否是包含Deposit和Balance的行（通常是新交易）
+                    if not is_new_transaction:
+                        # 匹配：字母数字(日期) 金额 余额
+                        deposit_balance_pattern = r'[A-Z0-9]+\(\d{2}[A-Z]{3}\d{2}\)\s+[\d,]+\.[\d]{2}\s+[\d,]+\.[\d]{2}'
+                        if re.search(deposit_balance_pattern, line):
+                            is_new_transaction = True
+                    
+                    if is_new_transaction:
+                        # 这是同一天内的新交易，先保存上一条交易
+                        self._save_text_transaction(curr_date_str, curr_details, curr_balance, current_currency, statement_date, transactions, running_balance)
+                        # 开始新交易（使用相同的日期）
+                        curr_details = [line]
+                        curr_balance = None
+                        continue
+                
+                # 不是新交易，属于上一条交易的 Details
                 if curr_date_str:
-                    # 检查这一行是否是独立的余额行
-                    # 特征：纯数字或带有 BALANCE 关键字
+                    # 检查这一行是否包含Balance
+                    # Balance通常出现在行末，且是较大的数字
                     balance_match = re.search(r'([\d,]+\.\d{2})[A-Z]*$', line)
-                    if balance_match and (len(line) < 20 or "BALANCE" in line.upper()):
-                         # 假设它是余额行
-                        curr_balance = parse_amount(balance_match.group(1))
+                    if balance_match:
+                        potential_balance = parse_amount(balance_match.group(1))
+                        # 如果这个数字很大（>1000），且行比较短，可能是Balance
+                        if potential_balance and potential_balance > 1000 and len(line) < 30:
+                            # 可能是余额行
+                            curr_balance = potential_balance
+                            # 从line中移除余额部分，剩余部分加入Details
+                            remaining = line[:balance_match.start()].strip()
+                            if remaining:
+                                curr_details.append(remaining)
+                        else:
+                            # 是 Details 的一部分
+                            curr_details.append(line)
                     else:
                         # 是 Details 的一部分
                         curr_details.append(line)
         
         # 循环结束，保存最后一条交易
-        if curr_date_str:
-             self._save_text_transaction(curr_date_str, curr_details, curr_balance, current_currency, statement_date, transactions)
+        if curr_date_str and curr_details:
+             self._save_text_transaction(curr_date_str, curr_details, curr_balance, current_currency, statement_date, transactions, running_balance)
              
         return current_currency
 
-    def _save_text_transaction(self, date_str, details_list, balance, currency, statement_date, transactions):
+    def _save_text_transaction(self, date_str, details_list, balance, currency, statement_date, transactions, running_balance: Dict[str, float]):
         """构建并保存文本交易"""
         full_details = " ".join(details_list)
         
         # 尝试从详情中提取金额
-        # 此时 full_details 应该已经被剔除了 Balance，剩下的数字是 Debit 或 Credit
+        # 注意：Details中可能包含多个数字（Withdrawal/Credit金额和Balance）
         amounts = re.findall(r'([\d,]+\.\d{2})', full_details)
         
         debit, credit = '', ''
+        extracted_balance = None
+        
+        # 从Details中提取Balance（通常是最后一个大数字，或者明确标记的）
+        # 如果Details中包含Balance，优先使用提取的Balance
+        if balance is not None:
+            extracted_balance = balance
+        elif amounts:
+            # 检查最后一个数字是否是Balance
+            # Balance通常出现在行末，且可能比较大
+            last_amount = parse_amount(amounts[-1])
+            # 如果最后一个数字很大（可能是Balance），且前面还有其他数字，则可能是Balance
+            if len(amounts) > 1:
+                # 有多个数字，最后一个可能是Balance
+                prev_amount = parse_amount(amounts[-2]) if len(amounts) >= 2 else None
+                # 如果最后一个数字明显大于前一个，可能是Balance
+                if prev_amount and last_amount > prev_amount * 10:
+                    extracted_balance = last_amount
+                    # 移除Balance，剩下的数字是交易金额
+                    amounts = amounts[:-1]
+        
+        # 获取当前运行余额
+        if currency not in running_balance:
+            running_balance[currency] = 0.0
+        current_balance = running_balance[currency]
         
         if amounts:
-            # 简单逻辑：取最后一个数字作为金额
+            # 取最后一个数字作为交易金额（已排除Balance）
             amount_val = parse_amount(amounts[-1])
             
-            # 判断方向：根据关键词
+            # 判断方向：优先根据交易类型标识判断，然后根据Balance变化
             is_credit = False
-            keywords = ['CREDIT', 'CR ', 'DEPOSIT', 'INTEREST', 'REBATE']
-            if any(k in full_details.upper() for k in keywords):
+            
+            # 首先检查明确的交易类型标识
+            # Credit关键词：明确的收入标识
+            credit_keywords = ['CREDIT', 'DEPOSIT', 'INTEREST', 'REBATE', 'PAID BY', '转账收入', '轉賬收入', 'CASH REBATE']
+            # Debit关键词：明确的支出标识
+            debit_keywords = ['WITHDRAWAL', '轉賬支出', '转账支出', 'POS MDC', 'CR TO']
+            
+            has_credit_keyword = any(k in full_details.upper() for k in credit_keywords)
+            has_debit_keyword = any(k in full_details.upper() for k in debit_keywords)
+            
+            if has_credit_keyword:
                 is_credit = True
+            elif has_debit_keyword:
+                is_credit = False
+            elif extracted_balance is not None:
+                # 如果没有明确标识，根据Balance变化判断
+                # 如果提取到了Balance，根据Balance变化判断
+                if extracted_balance > current_balance:
+                    is_credit = True  # Balance增加 = Credit
+                elif extracted_balance < current_balance:
+                    is_credit = False  # Balance减少 = Debit
+                # 如果Balance不变，默认是Debit（POS MDC通常是支出）
+            else:
+                # 如果既没有Balance也没有关键词，默认是Debit（POS MDC通常是支出）
+                is_credit = False
             
             if is_credit:
                 credit = amount_val
             else:
                 debit = amount_val
+        
+        # 计算Balance：如果提取到了Balance，使用提取的；否则基于运行余额计算
+        if extracted_balance is not None:
+            # 使用提取的Balance
+            final_balance = extracted_balance
+        else:
+            # 基于运行余额计算
+            credit_val = credit if credit else 0.0
+            debit_val = debit if debit else 0.0
+            final_balance = current_balance + credit_val - debit_val
+        
+        # 更新运行余额
+        running_balance[currency] = final_balance
         
         # 解析日期
         date = parse_date_hsbc(date_str, statement_date.year, statement_date.month)
@@ -270,7 +406,7 @@ class HSBCParser(BaseParser):
             'Payee': details_info.get('payee', 'Unknown'),
             'Debit': debit,
             'Credit': credit,
-            'Balance': balance if balance is not None else '',
+            'Balance': final_balance,
             'Reference': '',
             'Description': details_info.get('description', full_details)
         }
