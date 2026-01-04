@@ -3,15 +3,27 @@ HSBC 对账单解析器
 """
 import re
 import logging
+import json
 import pdfplumber
 import pandas as pd
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
 from .base_parser import BaseParser
 # 确保 utils 中有这些函数
 from ..utils import parse_date_hsbc, parse_amount, parse_month
+
+# 导入配置文件
+try:
+    import config
+except ImportError:
+    config = None
 
 
 class HSBCParser(BaseParser):
@@ -308,33 +320,145 @@ class HSBCParser(BaseParser):
              
         return current_currency
 
+    def _validate_math(self, prev_balance: float, credit: float, debit: float, new_balance: float) -> bool:
+        """
+        Level 2: 数学校验
+        校验：abs((prev_balance + credit - debit) - new_balance) < 0.01
+        """
+        if prev_balance is None or new_balance is None:
+            return False
+        
+        credit_val = credit if credit else 0.0
+        debit_val = debit if debit else 0.0
+        
+        expected_balance = prev_balance + credit_val - debit_val
+        diff = abs(expected_balance - new_balance)
+        
+        return diff < 0.01
+    
+    def _parse_line_with_ai(self, line_text: str, date_str: str) -> Optional[Dict[str, Any]]:
+        """
+        Level 3: AI 兜底解析
+        使用 DeepSeek API 解析单行交易文本
+        
+        返回: {"debit": float, "credit": float, "balance": float, "payee": str} 或 None
+        """
+        # 检查配置和依赖
+        if not config or not hasattr(config, 'DEEPSEEK_API_KEY') or not config.DEEPSEEK_API_KEY:
+            self.logger.warning("DeepSeek API Key 未配置，跳过 AI 解析")
+            return None
+        
+        if not OpenAI:
+            self.logger.warning("openai 库未安装，无法使用 AI 解析")
+            return None
+        
+        try:
+            client = OpenAI(
+                api_key=config.DEEPSEEK_API_KEY,
+                base_url=getattr(config, 'DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
+            )
+            
+            model = getattr(config, 'DEEPSEEK_MODEL', 'deepseek-chat')
+            
+            # 构造 Prompt
+            prompt = f"""你是一个银行对账单解析专家。请从以下一行银行交易文本中提取结构化信息。
+
+输入文本（可能格式错乱）：
+日期: {date_str}
+交易详情: {line_text}
+
+请提取以下信息：
+1. Debit (支出金额): 如果有支出，返回数值（不含逗号，保留2位小数）；如果没有，返回空字符串或0
+2. Credit (收入金额): 如果有收入，返回数值（不含逗号，保留2位小数）；如果没有，返回空字符串或0
+3. Balance (余额): 通常在文本末尾的大数字，返回数值（不含逗号，保留2位小数）
+4. Payee (收款方/付款方): 提取交易对手方名称，如果无法识别返回"Unknown"
+
+金融常识提示：
+- Balance 通常出现在行末
+- Debit 通常用于 Withdrawal/POS/转账支出等场景
+- Credit 通常用于 Deposit/转账收入/Interest 等场景
+- 同一行通常只有 Debit 或 Credit 其中之一，不会同时存在
+
+请返回 JSON 格式，示例：
+{{
+    "debit": "1234.56",
+    "credit": "",
+    "balance": "98765.43",
+    "payee": "MERCHANT NAME"
+}}
+
+或：
+{{
+    "debit": "",
+    "credit": "5000.00",
+    "balance": "103765.43",
+    "payee": "PAYER NAME"
+}}
+
+只返回 JSON，不要其他文字说明。"""
+            
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "你是一个专业的银行对账单解析助手。只返回有效的 JSON 格式数据，不要包含任何其他文字。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=500
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            # 清理可能的 markdown 代码块标记
+            if result_text.startswith("```json"):
+                result_text = result_text[7:]
+            elif result_text.startswith("```"):
+                result_text = result_text[3:]
+            if result_text.endswith("```"):
+                result_text = result_text[:-3]
+            result_text = result_text.strip()
+            
+            # 解析 JSON
+            result = json.loads(result_text)
+            
+            # 转换数据类型
+            parsed_result = {
+                "debit": parse_amount(str(result.get("debit", ""))) if result.get("debit") else '',
+                "credit": parse_amount(str(result.get("credit", ""))) if result.get("credit") else '',
+                "balance": parse_amount(str(result.get("balance", ""))) if result.get("balance") else None,
+                "payee": result.get("payee", "Unknown")
+            }
+            
+            self.logger.info(f"AI 解析成功: {parsed_result}")
+            return parsed_result
+            
+        except json.JSONDecodeError as e:
+            self.logger.warning(f"AI 返回的 JSON 解析失败: {e}, 原始响应: {result_text[:200]}")
+            return None
+        except Exception as e:
+            self.logger.warning(f"AI 解析失败: {e}, 将使用降级处理")
+            return None
+    
     def _save_text_transaction(self, date_str, details_list, balance, currency, statement_date, transactions, running_balance: Dict[str, float]):
-        """构建并保存文本交易"""
+        """构建并保存文本交易（三级解析机制：正则 -> 数学校验 -> AI 兜底）"""
         full_details = " ".join(details_list)
         
-        # 尝试从详情中提取金额
-        # 注意：Details中可能包含多个数字（Withdrawal/Credit金额和Balance）
-        amounts = re.findall(r'([\d,]+\.\d{2})', full_details)
-        
+        # ========== Level 1: 现有正则/文本分割逻辑 ==========
         debit, credit = '', ''
         extracted_balance = None
         
+        # 尝试从详情中提取金额
+        amounts = re.findall(r'([\d,]+\.\d{2})', full_details)
+        
         # 从Details中提取Balance（通常是最后一个大数字，或者明确标记的）
-        # 如果Details中包含Balance，优先使用提取的Balance
         if balance is not None:
             extracted_balance = balance
         elif amounts:
-            # 检查最后一个数字是否是Balance
-            # Balance通常出现在行末，且可能比较大
             last_amount = parse_amount(amounts[-1])
-            # 如果最后一个数字很大（可能是Balance），且前面还有其他数字，则可能是Balance
             if len(amounts) > 1:
-                # 有多个数字，最后一个可能是Balance
                 prev_amount = parse_amount(amounts[-2]) if len(amounts) >= 2 else None
-                # 如果最后一个数字明显大于前一个，可能是Balance
                 if prev_amount and last_amount > prev_amount * 10:
                     extracted_balance = last_amount
-                    # 移除Balance，剩下的数字是交易金额
                     amounts = amounts[:-1]
         
         # 获取当前运行余额
@@ -342,17 +466,12 @@ class HSBCParser(BaseParser):
             running_balance[currency] = 0.0
         current_balance = running_balance[currency]
         
+        # Level 1: 提取 debit 和 credit
         if amounts:
-            # 取最后一个数字作为交易金额（已排除Balance）
             amount_val = parse_amount(amounts[-1])
-            
-            # 判断方向：优先根据交易类型标识判断，然后根据Balance变化
             is_credit = False
             
-            # 首先检查明确的交易类型标识
-            # Credit关键词：明确的收入标识
             credit_keywords = ['CREDIT', 'DEPOSIT', 'INTEREST', 'REBATE', 'PAID BY', '转账收入', '轉賬收入', 'CASH REBATE']
-            # Debit关键词：明确的支出标识
             debit_keywords = ['WITHDRAWAL', '轉賬支出', '转账支出', 'POS MDC', 'CR TO']
             
             has_credit_keyword = any(k in full_details.upper() for k in credit_keywords)
@@ -363,31 +482,69 @@ class HSBCParser(BaseParser):
             elif has_debit_keyword:
                 is_credit = False
             elif extracted_balance is not None:
-                # 如果没有明确标识，根据Balance变化判断
-                # 如果提取到了Balance，根据Balance变化判断
                 if extracted_balance > current_balance:
-                    is_credit = True  # Balance增加 = Credit
+                    is_credit = True
                 elif extracted_balance < current_balance:
-                    is_credit = False  # Balance减少 = Debit
-                # 如果Balance不变，默认是Debit（POS MDC通常是支出）
-            else:
-                # 如果既没有Balance也没有关键词，默认是Debit（POS MDC通常是支出）
-                is_credit = False
+                    is_credit = False
             
             if is_credit:
                 credit = amount_val
             else:
                 debit = amount_val
         
-        # 计算Balance：如果提取到了Balance，使用提取的；否则基于运行余额计算
+        # 确定最终余额
         if extracted_balance is not None:
-            # 使用提取的Balance
             final_balance = extracted_balance
         else:
-            # 基于运行余额计算
             credit_val = credit if credit else 0.0
             debit_val = debit if debit else 0.0
             final_balance = current_balance + credit_val - debit_val
+        
+        # ========== Level 2: 数学校验 ==========
+        need_ai_fallback = False
+        
+        # 如果 Level 1 成功提取了数据，进行数学校验
+        if extracted_balance is not None and (debit or credit):
+            credit_val = credit if credit else 0.0
+            debit_val = debit if debit else 0.0
+            if not self._validate_math(current_balance, credit_val, debit_val, extracted_balance):
+                self.logger.warning(f"数学校验失败: prev={current_balance}, credit={credit_val}, debit={debit_val}, new={extracted_balance}, 行: {full_details[:100]}")
+                need_ai_fallback = True
+        # 如果 Level 1 没有提取到数据，但该行明显是交易行（包含数字），也需要 AI 兜底
+        elif not amounts and not extracted_balance:
+            # 检查是否是明显的交易行（包含常见交易关键词或数字模式）
+            if re.search(r'\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', full_details, re.IGNORECASE) or \
+               re.search(r'(POS|CR|DEPOSIT|WITHDRAWAL|TRANSFER)', full_details, re.IGNORECASE):
+                need_ai_fallback = True
+        
+        # ========== Level 3: AI 兜底 ==========
+        ai_payee = None  # 保存 AI 解析的 Payee
+        if need_ai_fallback:
+            self.logger.info(f"触发 AI 兜底解析: {full_details[:100]}")
+            ai_result = self._parse_line_with_ai(full_details, date_str)
+            if ai_result:
+                # 使用 AI 解析的结果
+                ai_debit = ai_result.get("debit", '')
+                ai_credit = ai_result.get("credit", '')
+                ai_balance = ai_result.get("balance")
+                ai_payee = ai_result.get("payee")  # 保存 AI 解析的 Payee
+                
+                # 如果 AI 返回了有效数据，使用 AI 的结果
+                if ai_balance is not None or ai_debit or ai_credit:
+                    debit = ai_debit
+                    credit = ai_credit
+                    if ai_balance is not None:
+                        final_balance = ai_balance
+                    else:
+                        # AI 没有返回余额，基于运行余额计算
+                        credit_val = credit if credit else 0.0
+                        debit_val = debit if debit else 0.0
+                        final_balance = current_balance + credit_val - debit_val
+                    
+                    self.logger.info(f"使用 AI 解析结果: debit={debit}, credit={credit}, balance={final_balance}")
+            else:
+                # AI 解析失败，使用降级处理（保留原始文本）
+                self.logger.warning(f"AI 解析失败，使用降级处理: {full_details[:100]}")
         
         # 更新运行余额
         running_balance[currency] = final_balance
@@ -396,14 +553,15 @@ class HSBCParser(BaseParser):
         date = parse_date_hsbc(date_str, statement_date.year, statement_date.month)
         if not date: return
 
-        # 提取 Payee
+        # 提取 Payee（如果 AI 解析了 Payee，优先使用）
         details_info = self._parse_transaction_details(full_details)
+        payee = ai_payee if ai_payee and ai_payee != "Unknown" else details_info.get('payee', 'Unknown')
 
         tx = {
             'Date': date,
             'Account Currency': currency,
             'Payer': 'Unknown',
-            'Payee': details_info.get('payee', 'Unknown'),
+            'Payee': payee,
             'Debit': debit,
             'Credit': credit,
             'Balance': final_balance,
